@@ -1,0 +1,128 @@
+diff --git a/arch/x86/include/uapi/asm/kvm.h b/arch/x86/include/uapi/asm/kvm.h
+index e68d6b448730..939666fd6e37 100644
+--- a/arch/x86/include/uapi/asm/kvm.h
++++ b/arch/x86/include/uapi/asm/kvm.h
+@@ -261,6 +261,7 @@ struct kvm_debug_exit_arch {
+ #define KVM_GUESTDBG_USE_HW_BP		0x00020000
+ #define KVM_GUESTDBG_INJECT_DB		0x00040000
+ #define KVM_GUESTDBG_INJECT_BP		0x00080000
++#define KVM_GUESTDBG_KVMI_SHORTCIRCUIT	0x00100000
+ 
+ /* for KVM_SET_GUEST_DEBUG */
+ struct kvm_guest_debug_arch {
+diff --git a/arch/x86/kvm/svm.c b/arch/x86/kvm/svm.c
+index 04f2630f4ed7..8ada1d097c75 100644
+--- a/arch/x86/kvm/svm.c
++++ b/arch/x86/kvm/svm.c
+@@ -223,6 +223,8 @@ struct vcpu_svm {
+ 	bool nmi_singlestep;
+ 	u64 nmi_singlestep_guest_rflags;
+ 
++	u64 guest_debug_singlestep_guest_rflags;
++
+ 	unsigned int3_injected;
+ 	unsigned long int3_rip;
+ 
+@@ -2722,9 +2724,15 @@ static void update_bp_intercept(struct kvm_vcpu *vcpu)
+ {
+ 	struct vcpu_svm *svm = to_svm(vcpu);
+ 
++	clr_exception_intercept(svm, DB_VECTOR);
+ 	clr_exception_intercept(svm, BP_VECTOR);
+ 
+ 	if (vcpu->guest_debug & KVM_GUESTDBG_ENABLE) {
++		if (vcpu->guest_debug & KVM_GUESTDBG_SINGLESTEP)
++		{
++			svm->guest_debug_singlestep_guest_rflags = svm_get_rflags(vcpu);
++			set_exception_intercept(svm, DB_VECTOR);
++		}
+ 		if (vcpu->guest_debug & KVM_GUESTDBG_USE_SW_BP)
+ 			set_exception_intercept(svm, BP_VECTOR);
+ 	} else
+@@ -2826,6 +2834,13 @@ static int db_interception(struct vcpu_svm *svm)
+ 
+ 	if (svm->vcpu.guest_debug &
+ 	    (KVM_GUESTDBG_SINGLESTEP | KVM_GUESTDBG_USE_HW_BP)) {
++		if (kvmi_vcpu_running_singlestep(vcpu)) {
++			kvmi_singlestep_done(vcpu);
++			if (svm->guest_debug_singlestep_guest_rflags & X86_EFLAGS_TF)
++				kvm_queue_exception(&svm->vcpu, DB_VECTOR);
++			return 1;
++		}
++
+ 		kvm_run->exit_reason = KVM_EXIT_DEBUG;
+ 		kvm_run->debug.arch.pc =
+ 			svm->vmcb->save.cs.base + svm->vmcb->save.rip;
+@@ -7468,6 +7483,21 @@ static bool svm_gpt_translation_fault(struct kvm_vcpu *vcpu)
+ 	return false;
+ }
+ 
++static void svm_control_singlestep(struct kvm_vcpu *vcpu, bool enable)
++{
++	struct kvm_guest_debug dbg = { .control = vcpu->guest_debug };
++
++	if (enable)
++		dbg.control |= KVM_GUESTDBG_ENABLE | KVM_GUESTDBG_SINGLESTEP;
++	else
++		dbg.control &= ~KVM_GUESTDBG_SINGLESTEP;
++	if (dbg.control == KVM_GUESTDBG_ENABLE)
++		dbg.control = 0;
++
++	dbg.control |= KVM_GUESTDBG_KVMI_SHORTCIRCUIT;
++	kvm_arch_vcpu_set_guest_debug(vcpu, &dbg);
++}
++
+ static struct kvm_x86_ops svm_x86_ops __ro_after_init = {
+ 	.cpu_has_kvm_support = has_svm,
+ 	.disabled_by_bios = is_disabled,
+@@ -7619,6 +7649,7 @@ static struct kvm_x86_ops svm_x86_ops __ro_after_init = {
+ 	.spt_fault = svm_spt_fault,
+ 	.gpt_translation_fault = svm_gpt_translation_fault,
+ 	.clear_page = clear_page,
++	.control_singlestep = svm_control_singlestep
+ };
+ 
+ static int __init svm_init(void)
+diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
+index f0d2d3fd22d5..661d4be22667 100644
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -6829,6 +6829,10 @@ static int kvm_vcpu_do_singlestep(struct kvm_vcpu *vcpu)
+ 	struct kvm_run *kvm_run = vcpu->run;
+ 
+ 	if (vcpu->guest_debug & KVM_GUESTDBG_SINGLESTEP) {
++		if (kvmi_vcpu_running_singlestep(vcpu)) {
++			kvmi_singlestep_done(vcpu);
++			return 1;
++		}
+ 		kvm_run->debug.arch.dr6 = DR6_BS | DR6_FIXED_1 | DR6_RTM;
+ 		kvm_run->debug.arch.pc = vcpu->arch.singlestep_rip;
+ 		kvm_run->debug.arch.exception = DB_VECTOR;
+@@ -9327,7 +9331,9 @@ int kvm_arch_vcpu_set_guest_debug(struct kvm_vcpu *vcpu,
+ 			kvm_queue_exception(vcpu, BP_VECTOR);
+ 	}
+ 
+-	if (kvmi_monitor_bp_intercept(vcpu, dbg->control)) {
++	if (dbg->control & KVM_GUESTDBG_KVMI_SHORTCIRCUIT)
++		dbg->control &= ~KVM_GUESTDBG_KVMI_SHORTCIRCUIT;
++	else if (kvmi_monitor_bp_intercept(vcpu, dbg->control)) {
+ 		r = -EBUSY;
+ 		goto out;
+ 	}
+@@ -9356,14 +9362,14 @@ int kvm_arch_vcpu_set_guest_debug(struct kvm_vcpu *vcpu,
+ 		vcpu->arch.singlestep_rip = kvm_rip_read(vcpu) +
+ 			get_segment_base(vcpu, VCPU_SREG_CS);
+ 
++	kvm_x86_ops->update_bp_intercept(vcpu);
++
+ 	/*
+ 	 * Trigger an rflags update that will inject or remove the trace
+ 	 * flags.
+ 	 */
+ 	kvm_set_rflags(vcpu, rflags);
+ 
+-	kvm_x86_ops->update_bp_intercept(vcpu);
+-
+ 	r = 0;
+ 
+ out:

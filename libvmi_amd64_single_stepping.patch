@@ -1,0 +1,227 @@
+diff --git a/examples/CMakeLists.txt b/examples/CMakeLists.txt
+index 631b04a..cbd0630 100644
+--- a/examples/CMakeLists.txt
++++ b/examples/CMakeLists.txt
+@@ -33,6 +33,10 @@ add_executable(breakpoint-recoil-example breakpoint-recoil-example.c)
+ set_property(TARGET breakpoint-recoil-example PROPERTY C_STANDARD 99)
+ target_link_libraries(breakpoint-recoil-example vmi_shared)
+ 
++add_executable(hide-singlestep-example hide-singlestep-example.c)
++set_property(TARGET hide-singlestep-example PROPERTY C_STANDARD 99)
++target_link_libraries(hide-singlestep-example vmi_shared)
++
+ add_executable(wait-for-domain-example wait-for-domain-example.c)
+ target_link_libraries(wait-for-domain-example vmi_shared)
+ 
+diff --git a/examples/hide-singlestep-example.c b/examples/hide-singlestep-example.c
+new file mode 100644
+index 0000000..ec5c4db
+--- /dev/null
++++ b/examples/hide-singlestep-example.c
+@@ -0,0 +1,206 @@
++
++#include <stdlib.h>
++#include <string.h>
++#include <errno.h>
++#include <sys/mman.h>
++#include <stdio.h>
++#include <inttypes.h>
++#include <signal.h>
++#include <unistd.h>
++
++#include <libvmi/libvmi.h>
++#include <libvmi/events.h>
++
++#define X86_EFLAGS_TF (1 << 8)
++
++static char fake_flag = 0;
++static int interrupted = 0;
++static unsigned int step = 0;
++static void close_handler(int sig)
++{
++    interrupted = sig;
++}
++
++const char* instrs[] =
++{
++    "pushf",
++    "pop QWORD PTR [rbp-0x8]",
++    "<unkown>"
++};
++
++event_response_t breakpoint_cb(vmi_instance_t vmi, vmi_event_t *event)
++{
++    (void) vmi;
++    event->interrupt_event.reinject = 0;
++    event->x86_regs->rip++;
++    step = 0;
++    fprintf(stdout, "---------------------------\n");
++    return VMI_EVENT_RESPONSE_SET_REGISTERS | VMI_EVENT_RESPONSE_TOGGLE_SINGLESTEP;
++}
++
++event_response_t single_step_cb(vmi_instance_t vmi, vmi_event_t *event)
++{
++    (void) vmi; (void) event;
++    uint64_t eflags;
++
++    step++;
++    fprintf(stdout, "Step %d - %s\n", step, instrs[step > 2 ? 2 : step - 1]);
++
++#if defined(TARGET_POPF)
++    if (step == 1)
++    {
++        ACCESS_CONTEXT(ctx,
++                       .translate_mechanism = VMI_TM_PROCESS_DTB,
++                       .addr = event->x86_regs->rsp + 8,
++                       .pt = event->x86_regs->cr3 & ~0x1000ull);
++        if (VMI_SUCCESS == vmi_read_64(vmi, &ctx, &eflags))
++        {
++            eflags |= X86_EFLAGS_TF;
++            vmi_write_64(vmi, &ctx, &eflags);
++        }
++    }
++
++    if (step == 2 && fake_flag)
++    {
++        ACCESS_CONTEXT(ctx,
++                       .translate_mechanism = VMI_TM_PROCESS_DTB,
++                       .addr = event->x86_regs->rsp, /* stack pointer has moved. */
++                       .pt = event->x86_regs->cr3 & ~0x1000ull);
++        if (VMI_SUCCESS == vmi_read_64(vmi, &ctx, &eflags))
++        {
++            eflags &= ~X86_EFLAGS_TF;
++            vmi_write_64(vmi, &ctx, &eflags);
++        }
++    }
++#elif defined(TARGET_CLI)
++    event->x86_regs->rsp++;
++    return VMI_EVENT_RESPONSE_SET_REGISTERS;
++#else
++    if (step == 2 && fake_flag)
++    {
++        ACCESS_CONTEXT(ctx,
++                       .translate_mechanism = VMI_TM_PROCESS_DTB,
++                       .addr = event->x86_regs->rsp + 8,
++                       .pt = event->x86_regs->cr3 & ~0x1000ull);
++        if (VMI_SUCCESS == vmi_read_64(vmi, &ctx, &eflags))
++        {
++            eflags &= ~X86_EFLAGS_TF;
++            vmi_write_64(vmi, &ctx, &eflags);
++        }
++    }
++#endif
++
++    return VMI_EVENT_RESPONSE_NONE;
++}
++
++int main (int argc, char **argv)
++{
++    struct sigaction act = {0};
++    vmi_instance_t vmi = {0};
++    vmi_init_data_t *init_data = NULL;
++    int retcode = 1;
++
++    char *name = NULL;
++
++    if (argc < 3) {
++        fprintf(stderr, "Usage: %s <name of VM> [<socket>] [<fake_flag>]\n", argv[0]);
++        return retcode;
++    }
++
++    name = argv[1];
++
++    // KVMi socket ?
++    if (argc == 3 || argc == 4) {
++        char *path = argv[2];
++
++        init_data = malloc(sizeof(vmi_init_data_t) + sizeof(vmi_init_data_entry_t));
++        init_data->count = 1;
++        init_data->entry[0].type = VMI_INIT_DATA_KVMI_SOCKET;
++        init_data->entry[0].data = strdup(path);
++    }
++
++    if (argc == 4)
++        fake_flag = atoi(argv[3]);
++
++    /* for a clean exit */
++    act.sa_handler = close_handler;
++    act.sa_flags = 0;
++    sigemptyset(&act.sa_mask);
++    sigaction(SIGHUP,  &act, NULL);
++    sigaction(SIGTERM, &act, NULL);
++    sigaction(SIGINT,  &act, NULL);
++    sigaction(SIGALRM, &act, NULL);
++
++    // init complete since we need symbols translation
++    if (VMI_FAILURE ==
++            vmi_init_complete(&vmi, name, VMI_INIT_DOMAINNAME | VMI_INIT_EVENTS, init_data,
++                              VMI_CONFIG_GLOBAL_FILE_ENTRY, NULL, NULL)) {
++        fprintf(stderr, "Failed to init LibVMI library.\n");
++        goto error_exit;
++    }
++
++    printf("LibVMI init succeeded!\n");
++
++    // register int3 event
++    vmi_event_t int_event;
++    memset(&int_event, 0, sizeof(vmi_event_t));
++    int_event.version = VMI_EVENTS_VERSION;
++    int_event.type = VMI_EVENT_INTERRUPT;
++    int_event.interrupt_event.intr = INT3;
++    int_event.callback = breakpoint_cb;
++
++    printf("Register interrupt event\n");
++    if (VMI_FAILURE == vmi_register_event(vmi, &int_event)) {
++        fprintf(stderr, "Failed to register interrupt event\n");
++        goto error_exit;
++    }
++
++    // get number of vcpus
++    unsigned int num_vcpus = vmi_get_num_vcpus(vmi);
++
++    // register singlestep event
++    // disabled by default
++    vmi_event_t sstep_event = {0};
++    sstep_event.version = VMI_EVENTS_VERSION;
++    sstep_event.type = VMI_EVENT_SINGLESTEP;
++    sstep_event.callback = single_step_cb;
++    sstep_event.ss_event.enable = false;
++    // allow singlestep on all VCPUs
++    for (unsigned int vcpu=0; vcpu < num_vcpus; vcpu++)
++        SET_VCPU_SINGLESTEP(sstep_event.ss_event, vcpu);
++
++    printf("Register singlestep event\n");
++    if (VMI_FAILURE == vmi_register_event(vmi, &sstep_event)) {
++        fprintf(stderr, "Failed to register singlestep event\n");
++        goto error_exit;
++    }
++
++    // event loop
++    while (!interrupted) {
++        /*printf("Waiting for events...\n");*/
++        if (VMI_FAILURE == vmi_events_listen(vmi,500)) {
++            fprintf(stderr, "Failed to listen on events\n");
++            goto error_exit;
++        }
++    }
++    printf("Finished with test.\n");
++
++    retcode = 0;
++error_exit:
++    // cleanup queue
++    if (vmi_are_events_pending(vmi))
++        vmi_events_listen(vmi, 0);
++
++    vmi_clear_event(vmi, &int_event, NULL);
++    vmi_clear_event(vmi, &sstep_event, NULL);
++
++    vmi_destroy(vmi);
++
++    if (init_data) {
++        free(init_data->entry[0].data);
++        free(init_data);
++    }
++
++    return retcode;
++}
++
